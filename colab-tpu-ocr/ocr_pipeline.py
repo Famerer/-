@@ -72,6 +72,21 @@ def detect_device():
 
 
 DEVICE, DEVICE_KIND, DEVICE_INFO = detect_device()
+if DEVICE_KIND == "tpu":
+    try:
+        import torch_xla.runtime as xr
+        DEVICE_INFO += " | device_type=" + str(xr.device_type())
+    except Exception:
+        pass
+
+# CPU-рантайм в Colab: автоматически урезаем масштаб, чтобы обучение не шло часами.
+if not SMOKE and DEVICE_KIND == "cpu":
+    print("Внимание: выдан CPU-рантайм, автоматически уменьшаю объём обучения")
+    CFG.update(img_w=256, n_train=2500, n_val=300, n_test=300,
+               n_multiline=30, epochs=4, batch=32, c=24, hidden=96)
+if os.environ.get("OCR_QUICK") == "1":
+    CFG.update(n_train=640, n_val=60, n_test=60, n_multiline=8, epochs=3, batch=32)
+
 print("Ускоритель:", DEVICE_INFO)
 print("Режим:", "SMOKE (локальная проверка)" if SMOKE else "ПОЛНОЕ ОБУЧЕНИЕ")
 print("Конфиг:", json.dumps({k: v for k, v in CFG.items() if k != "small_vocab"}))
@@ -310,17 +325,38 @@ class CRNN(nn.Module):
             nn.MaxPool2d((3, 1), (3, 1)),
             nn.Conv2d(c * 4, c * 4, 3, padding=1), nn.BatchNorm2d(c * 4), nn.ReLU(inplace=True),
         )
-        self.rnn = nn.GRU(c * 4, hidden, num_layers=2, batch_first=True,
-                          bidirectional=True, dropout=0.1)
-        self.head = nn.Linear(hidden * 2, ncls)
+        # Transformer вместо RNN: только matmul/LayerNorm/softmax,
+        # то есть 100% совместимо с XLA/TPU (у RNN на TPU бывают неподдерживаемые операции).
+        dim = c * 4
+        pe = torch.zeros(1, 512, dim)
+        pos = torch.arange(512).float().unsqueeze(1)
+        div = torch.exp(torch.arange(0, dim, 2).float() * -math.log(10000.0) / dim)
+        pe[0, :, 0::2] = torch.sin(pos * div)
+        pe[0, :, 1::2] = torch.cos(pos * div)
+        self.register_buffer("pe", pe)
+        layer = nn.TransformerEncoderLayer(d_model=dim, nhead=4,
+                                           dim_feedforward=hidden * 2,
+                                           dropout=0.1, activation="gelu",
+                                           batch_first=True)
+        self.enc = nn.TransformerEncoder(layer, num_layers=2)
+        self.head = nn.Linear(dim, ncls)
 
     def forward(self, x):
         f = self.cnn(x).mean(dim=2).permute(0, 2, 1)   # [B, T, C]
-        z, _ = self.rnn(f)
+        f = f + self.pe[:, :f.size(1), :]
+        z = self.enc(f)
         return self.head(z).log_softmax(2)
 
 
 model = CRNN(NCLS, CFG["c"], CFG["hidden"]).to(DEVICE)
+
+
+def save_ckpt(path):
+    # На TPU state_dict содержит XLA-тензоры: явно переносим на CPU перед сохранением.
+    sd = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+    torch.save(sd, path)
+
+
 print("Параметров модели:", sum(p.numel() for p in model.parameters()))
 print("Длина последовательности T = img_w/4 =", CFG["img_w"] // 4)
 
@@ -357,7 +393,7 @@ for ep in range(1, CFG["epochs"] + 1):
     val = float(total.cpu()) / max(1, nb) if torch.is_tensor(total) else total / max(1, nb)
     if val < best_loss:
         best_loss = val
-        torch.save(model.state_dict(), OUT / "ocr_crnn.pt")
+        save_ckpt(OUT / "ocr_crnn.pt")
     print("эпоха %2d/%d  CTC loss = %.4f  lr = %.2e  t = %.1fs"
           % (ep, CFG["epochs"], val, opt.param_groups[0]["lr"], time.time() - t0))
 
@@ -585,7 +621,7 @@ report = dict(
     examples=[dict(surface=r[0], gt=r[1], pred=r[2]) for r in test_rows[:12]],
 )
 (OUT / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-torch.save(model.state_dict(), OUT / "ocr_crnn.pt")
+save_ckpt(OUT / "ocr_crnn.pt")
 print("\nГОТОВО. report.json, ocr_crnn.pt, demo_multiline.png ->", OUT)
 print("Итог: CER=%.4f | word_acc=%.3f | space_F1=%.3f | многострочность lines_ok=%.3f"
       % (test_m["cer"], test_m["word_acc"], test_m["space_f1"], multi_m["lines_ok"]))

@@ -47,7 +47,6 @@ nb = {
     "metadata": {
         "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
         "language_info": {"name": "python", "version": "3.11"},
-        "accelerator": "TPU",
         "colab": {"provenance": [], "toc_visible": True},
     },
     "nbformat": 4,
