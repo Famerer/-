@@ -1,24 +1,25 @@
 # %% [markdown]
 # # OCR на TPU v5e-1: буквы, цифры, слова, пробелы, многострочность, разные поверхности
 #
-# Полностью самодостаточный ноутбук. Ничего не скачивается: модель обучается на
-# синтетических данных, которые генерируются прямо здесь.
+# Самодостаточный ноутбук: ничего не скачивается, обучающие данные генерируются здесь же.
 #
 # Что умеет:
-# - читать **латиницу в обоих регистрах и цифры**;
-# - сохранять **пробелы между словами** (отдельный класс + геометрическая проверка промежутков);
-# - читать **несколько строк** (сегментация строк + распознавание каждой);
-# - работать на **разных поверхностях**: бумага, градиент/блик, школьная доска, камень, дерево,
-#   плюс шум, размытие, поворот, изменение яркости и контраста.
+# - **латиница A-Z / a-z и цифры 0-9** — CNN-классификатор символов;
+# - **слова и пробелы** — пробел определяется по геометрии межсимвольных зазоров;
+# - **несколько строк** — сегментация строк по проекции чернил, затем чтение каждой;
+# - **разные поверхности** — бумага, градиент, блик, доска, камень, дерево + шум,
+#   размытие, поворот, яркость/контраст; инференс использует локальный контраст,
+#   поэтому одинаково работает и на тёмном, и на светлом фоне.
 #
-# Архитектура: CNN -> BiGRU -> CTC. Ускоритель выбирается автоматически:
-# TPU (torch_xla) -> GPU (CUDA) -> CPU. На TPU v5e-1 всё считается без изменений кода.
+# Конвейер: `адаптивный контраст -> сегментация строк -> сегментация символов
+# -> CNN (TPU/GPU/CPU) -> восстановление пробелов по зазорам -> сборка текста`.
 #
-# **Запуск:** Runtime -> Change runtime type -> TPU v5e-1, затем Runtime -> Run all.
-# Для быстрой локальной проверки: `OCR_SMOKE=1 python ocr_pipeline.py`.
+# Ускоритель выбирается автоматически: TPU (torch_xla) -> GPU (CUDA) -> CPU.
+# В Colab: Среда выполнения -> Сменить среду выполнения -> **TPU v5e-1**, затем «Выполнить все».
+# Локальная проверка: `OCR_SMOKE=1 python ocr_pipeline.py`.
 #
 # %% [markdown]
-# ## 1. Настройки и ускоритель
+# ## 1. Настройки, ускоритель, алфавит
 # %%
 import os, sys, math, random, string, time, json
 from pathlib import Path
@@ -37,23 +38,6 @@ random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
-CFG = dict(
-    img_h=48,
-    img_w=256 if SMOKE else 320,
-    n_train=1600 if SMOKE else 24000,
-    n_val=240 if SMOKE else 1600,
-    n_test=180 if SMOKE else 1200,
-    n_multiline=24 if SMOKE else 160,
-    epochs=8 if SMOKE else 14,
-    batch=32 if SMOKE else 128,
-    c=24 if SMOKE else 48,
-    hidden=96 if SMOKE else 192,
-    lr=2e-3,
-    small_vocab=SMOKE,
-)
-OUT = Path(os.environ.get("OCR_OUT", str(Path(__file__).resolve().parent / "out")))
-OUT.mkdir(parents=True, exist_ok=True)
-
 XM = None
 
 
@@ -63,7 +47,7 @@ def detect_device():
         import torch_xla.core.xla_model as xm
         XM = xm
         dev = xm.xla_device()
-        return dev, "tpu", "TPU (torch_xla / PJRT): " + str(dev)
+        return dev, "tpu", "TPU (torch_xla): " + str(dev)
     except Exception as exc:
         note = "torch_xla недоступен (%s)" % type(exc).__name__
     if torch.cuda.is_available():
@@ -79,33 +63,39 @@ if DEVICE_KIND == "tpu":
     except Exception:
         pass
 
-# CPU-рантайм в Colab: автоматически урезаем масштаб, чтобы обучение не шло часами.
+CFG = dict(
+    char_size=32,
+    n_train=12400 if SMOKE else 60000,
+    epochs=6 if SMOKE else 10,
+    batch=128,
+    c=32,
+    lr=2e-3,
+    n_test=120 if SMOKE else 600,
+    n_multiline=30 if SMOKE else 160,
+)
+# Colab иногда выдаёт CPU без ускорителя — урезаем объём, чтобы не считать часами.
 if not SMOKE and DEVICE_KIND == "cpu":
     print("Внимание: выдан CPU-рантайм, автоматически уменьшаю объём обучения")
-    CFG.update(img_w=256, n_train=2500, n_val=300, n_test=300,
-               n_multiline=30, epochs=4, batch=32, c=24, hidden=96)
+    CFG.update(n_train=16000, epochs=6, batch=128)
 if os.environ.get("OCR_QUICK") == "1":
-    CFG.update(n_train=640, n_val=60, n_test=60, n_multiline=8, epochs=3, batch=32)
+    CFG.update(n_train=2500, epochs=2, n_test=40, n_multiline=10)
 
+OUT = Path(os.environ.get("OCR_OUT", str(Path(__file__).resolve().parent / "out")))
+OUT.mkdir(parents=True, exist_ok=True)
 print("Ускоритель:", DEVICE_INFO)
-print("Режим:", "SMOKE (локальная проверка)" if SMOKE else "ПОЛНОЕ ОБУЧЕНИЕ")
-print("Конфиг:", json.dumps({k: v for k, v in CFG.items() if k != "small_vocab"}))
+print("Режим:", "SMOKE" if SMOKE else "ПОЛНОЕ ОБУЧЕНИЕ", "| конфиг:", json.dumps(CFG))
 print("Выходная папка:", OUT)
 
-# %%
-CHARS = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-CHAR2IDX = {ch: i + 1 for i, ch in enumerate(CHARS)}
-IDX2CHAR = {i + 1: ch for i, ch in enumerate(CHARS)}
-NCLS = len(CHARS) + 1          # 0 = CTC blank
-BLANK = 0
+CHARS = string.digits + string.ascii_uppercase + string.ascii_lowercase
+CHAR2IDX = {ch: i for i, ch in enumerate(CHARS)}
+IDX2CHAR = {i: ch for i, ch in enumerate(CHARS)}
+NCLS = len(CHARS)
 SURFACES = ["paper", "gradient", "glare", "chalkboard", "stone", "wood"]
-
 SMOKE_WORDS = [
     "cat", "dog", "sun", "moon", "code", "game", "tpu", "ai", "robot", "pixel",
     "level", "boss", "stone", "wood", "paper", "light", "dark", "word", "line", "read",
     "hello", "world", "test", "rust", "godot", "2026", "42", "x9", "abc", "zero",
 ]
-
 FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -122,12 +112,10 @@ FONT_CANDIDATES = [
     "C:/Windows/Fonts/georgia.ttf", "C:/Windows/Fonts/comic.ttf",
 ]
 FONTS = [p for p in FONT_CANDIDATES if Path(p).is_file()]
-print("Найдено шрифтов:", len(FONTS))
+print("Классов:", NCLS, "| шрифтов:", len(FONTS))
 
 
 class R:
-    """Один ГПСЧ на生成: python-random для скаляров, numpy для массивов."""
-
     def __init__(self, seed):
         self.p = random.Random(seed)
         self.n = np.random.default_rng(seed % (2 ** 32))
@@ -158,10 +146,8 @@ def lowfreq(rng, h, w, scale=12):
 
 
 def make_surface(rng, w, h, kind):
-    """Разные поверхности + освещение. Возвращает RGB и флаг 'тёмный фон'."""
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-    lf = lowfreq(rng, h, w, 12)
-    n = rng.normal(0, 1, (h, w))
+    lf, n = lowfreq(rng, h, w, 12), rng.normal(0, 1, (h, w))
     dark = False
     if kind == "paper":
         base = 236 + lf * 0.10 + n * 3
@@ -169,11 +155,9 @@ def make_surface(rng, w, h, kind):
         base = 228 - 75 * (xx / w) + lf * 0.12 + n * 4
     elif kind == "glare":
         cx, cy = rng.uniform(0.2, 0.8) * w, rng.uniform(0.2, 0.8) * h
-        base = 232 + lf * 0.10 + n * 3
-        base = base + 85 * np.exp(-(((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * (w * 0.25) ** 2)))
+        base = 232 + lf * 0.10 + n * 3 + 85 * np.exp(-(((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * (w * 0.25) ** 2)))
     elif kind == "chalkboard":
-        base = 44 + lf * 0.30 + n * 6
-        dark = True
+        base, dark = 44 + lf * 0.30 + n * 6, True
     elif kind == "stone":
         base = 152 + lf * 0.55 + n * 10
     elif kind == "wood":
@@ -182,28 +166,43 @@ def make_surface(rng, w, h, kind):
         base = 230 + lf * 0.1 + n * 4
     base = np.clip(base, 0, 255)
     tint = rng.normal(0, 5, 3).astype(np.float32)
-    rgb = np.clip(base[..., None] + tint[None, None, :], 0, 255).astype(np.uint8)
-    return rgb, dark
+    return np.clip(base[..., None] + tint[None, None, :], 0, 255).astype(np.uint8), dark
 
 
-def _font_for(rng, text, w):
+def pick_font(rng, size=None):
     if not FONTS:
         try:
-            return ImageFont.load_default(size=30), 30
+            return ImageFont.load_default(size=size or 30), size or 30
         except TypeError:
             return ImageFont.load_default(), 12
-    fp = rng.choice(FONTS)
-    size = rng.randint(26, 36)
-    font = ImageFont.truetype(fp, size)
-    def est(f, s):
-        return sum((s * 0.5 + 2) if ch == " " else (f.getlength(ch) + 1.4) for ch in text)
-    while est(font, size) > w - 24 and size > 16:
-        size -= 2
-        font = ImageFont.truetype(fp, size)
-    return font, size
+    size = size or rng.randint(26, 36)
+    return ImageFont.truetype(rng.choice(FONTS), size), size
 
 
-def _draw_text(d, text, font, x, y, size, rng):
+def composite(mask, rgb, dark, rng, h, w):
+    a = np.asarray(mask).astype(np.float32) / 255.0
+    a *= np.clip(1 + lowfreq(rng, h, w, 7) / 420, 0.72, 1.28)
+    a = np.clip(a, 0, 1)
+    ink = rng.normal(228 if dark else 26, 7 if dark else 9, 3).astype(np.float32)
+    ink = np.clip(ink, 0, 255)
+    img = rgb.astype(np.float32) * (1 - a[..., None]) + ink[None, None, :] * a[..., None]
+    return Image.fromarray(np.clip(img, 0, 255).astype(np.uint8))
+
+
+def augment(im, rng, rgb, strong=False):
+    fill = tuple(int(v) for v in rgb[0, 0])
+    if rng.random() < (0.75 if strong else 0.4):
+        im = im.rotate(rng.uniform(-4 if strong else -1.6, 4 if strong else 1.6),
+                       resample=Image.BILINEAR, fillcolor=fill)
+    if rng.random() < 0.45:
+        im = im.filter(ImageFilter.GaussianBlur(rng.uniform(0.2, 0.9)))
+    arr = np.asarray(im).astype(np.float32)
+    arr = np.clip((arr - 127.5) * rng.uniform(0.8, 1.3) + 127.5 + rng.uniform(-16, 16), 0, 255)
+    arr = arr + rng.normal(0, 5, arr.shape)
+    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8)).convert("L")
+
+
+def draw_text(d, text, font, x, y, size, rng):
     for ch in text:
         if ch == " ":
             x += size * 0.5 + rng.randint(0, 4)
@@ -214,32 +213,8 @@ def _draw_text(d, text, font, x, y, size, rng):
     return x
 
 
-def _composite(mask, rgb, dark, rng, h, w):
-    a = np.asarray(mask).astype(np.float32) / 255.0
-    a *= np.clip(1 + lowfreq(rng, h, w, 7) / 420, 0.72, 1.28)
-    a = np.clip(a, 0, 1)
-    if dark:
-        ink = np.clip(rng.normal(228, 7, 3), 0, 255).astype(np.float32)
-    else:
-        ink = np.clip(rng.normal(26, 9, 3), 0, 255).astype(np.float32)
-    img = rgb.astype(np.float32) * (1 - a[..., None]) + ink[None, None, :] * a[..., None]
-    return Image.fromarray(np.clip(img, 0, 255).astype(np.uint8))
-
-
-def _augment(im, rng, rgb):
-    fill = tuple(int(v) for v in rgb[0, 0])
-    if rng.random() < 0.40:
-        im = im.rotate(rng.uniform(-1.6, 1.6), resample=Image.BILINEAR, fillcolor=fill)
-    if rng.random() < 0.45:
-        im = im.filter(ImageFilter.GaussianBlur(rng.uniform(0.2, 0.85)))
-    arr = np.asarray(im).astype(np.float32)
-    arr = np.clip((arr - 127.5) * rng.uniform(0.82, 1.25) + 127.5 + rng.uniform(-14, 14), 0, 255)
-    arr = arr + rng.normal(0, 4, arr.shape)
-    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8)).convert("L")
-
-
 def random_word(rng):
-    if CFG["small_vocab"]:
+    if SMOKE:
         return rng.choice(SMOKE_WORDS)
     return "".join(rng.choice(string.ascii_letters + string.digits) for _ in range(rng.randint(2, 8)))
 
@@ -251,46 +226,41 @@ def random_line(rng):
     return " ".join(words)
 
 
-def render_line(text, rng, force_surface=None):
-    w, h = CFG["img_w"], CFG["img_h"]
-    kind = force_surface or rng.choice(SURFACES)
-    rgb, dark = make_surface(rng, w, h, kind)
-    mask = Image.new("L", (w, h), 0)
-    d = ImageDraw.Draw(mask)
-    font, size = _font_for(rng, text, w)
-    tw = sum((size * 0.5 + 2) if ch == " " else (font.getlength(ch) + 1.4) for ch in text)
-    x = max(6, min(w - tw - 6, rng.randint(8, max(9, w - 10))))
-    y = (h - size) // 2 - 2 + rng.randint(-2, 2)
-    _draw_text(d, text, font, x, y, size, rng)
-    return _augment(_composite(mask, rgb, dark, rng, h, w), rng, rgb)
-
-
-def render_multiline(lines, rng, force_surface=None):
-    w = CFG["img_w"]
-    lh, pad = 64, 20
-    h = pad * 2 + len(lines) * lh
-    kind = force_surface or rng.choice(SURFACES)
-    rgb, dark = make_surface(rng, w, h, kind)
-    mask = Image.new("L", (w, h), 0)
-    d = ImageDraw.Draw(mask)
-    for i, text in enumerate(lines):
-        font, size = _font_for(rng, text, w)
-        x = rng.randint(10, 34)
-        y = pad + i * lh + (lh - size) // 2 - 2
-        _draw_text(d, text, font, x, y, size, rng)
-    return _augment(_composite(mask, rgb, dark, rng, h, w), rng, rgb)
-
-
-def to_tensor(gray):
-    a = np.asarray(gray.convert("L"), dtype=np.float32) / 255.0
-    z = np.clip((a - a.mean()) / (a.std() + 1e-5), -3, 3) / 3.0
-    return torch.from_numpy(z[None, None, :, :].copy())
-
-
 # %% [markdown]
-# ## 2. Датасет и модель (CNN + BiGRU + CTC)
+# ## 2. Синтетические данные: одиночные символы, строки, документы
 # %%
-class LineDataset(Dataset):
+def render_char(ch, rng, clean=False):
+    S = 40
+    rgb, dark = make_surface(rng, S, S, rng.choice(SURFACES))
+    font, size = pick_font(rng, rng.randint(24, 34))
+    mask = Image.new("L", (S, S), 0)
+    d = ImageDraw.Draw(mask)
+    w = font.getlength(ch)
+    x = (S - w) / 2 + rng.uniform(-3, 3)
+    y = (S - size) / 2 - 2 + rng.uniform(-3, 3)
+    d.text((x, y), ch, font=font, fill=255, anchor="lt",
+           stroke_width=1 if rng.random() < 0.3 else 0, stroke_fill=255)
+    im = composite(mask, rgb, dark, rng, S, S)
+    return im.convert("L") if clean else augment(im, rng, rgb, strong=True)
+
+
+def norm_img(gray, size=32, pad_value=None):
+    arr = np.asarray(gray.convert("L"), dtype=np.float32) / 255.0
+    z = np.clip((arr - arr.mean()) / (arr.std() + 1e-5), -3, 3) / 3.0
+    im = Image.fromarray(np.clip((z + 1) * 127.5, 0, 255).astype(np.uint8))
+    bw, bh = im.size
+    scale = min(size / bw, size / bh)
+    nw, nh = max(1, int(bw * scale)), max(1, int(bh * scale))
+    im = im.resize((nw, nh), Image.BILINEAR)
+    bg = int(pad_value if pad_value is not None else np.median(np.asarray(im)))
+    canvas = Image.new("L", (size, size), bg)
+    canvas.paste(im, ((size - nw) // 2, (size - nh) // 2))
+    a = np.asarray(canvas, dtype=np.float32) / 255.0
+    a = (a - 0.5) / 0.5
+    return torch.from_numpy(a[None, :, :].copy())
+
+
+class CharDataset(Dataset):
     def __init__(self, n, seed):
         self.n, self.seed = n, seed
 
@@ -299,215 +269,200 @@ class LineDataset(Dataset):
 
     def __getitem__(self, i):
         rng = R(self.seed + i * 7919)
-        text = random_line(rng)
-        img = render_line(text, rng)
-        target = torch.tensor([CHAR2IDX[ch] for ch in text], dtype=torch.long)
-        return to_tensor(img), target, text
+        ch = CHARS[i % NCLS]
+        return norm_img(render_char(ch, rng, clean=(rng.random() < 0.45))), CHAR2IDX[ch]
 
 
-def collate(batch):
-    xs = torch.cat([b[0] for b in batch], 0)
-    ys = torch.cat([b[1] for b in batch], 0)
-    lens = torch.tensor([len(b[1]) for b in batch], dtype=torch.long)
-    return xs, ys, lens, [b[2] for b in batch]
+def render_line(text, rng, force_surface=None, w=320):
+    h = 48
+    rgb, dark = make_surface(rng, w, h, force_surface or rng.choice(SURFACES))
+    font, size = pick_font(rng)
+    est = lambda f, s: sum((s * 0.5 + 2) if c == " " else (f.getlength(c) + 1.4) for c in text)
+    while est(font, size) > w - 24 and size > 16:
+        size -= 2
+        font, _ = pick_font(rng, size)
+    tw = est(font, size)
+    x = rng.randint(10, max(11, int(w - tw - 10)))
+    y = (h - size) // 2 - 2 + rng.randint(-2, 2)
+    mask = Image.new("L", (w, h), 0)
+    draw_text(ImageDraw.Draw(mask), text, font, x, y, size, rng)
+    return augment(composite(mask, rgb, dark, rng, h, w), rng, rgb)
 
 
-class CRNN(nn.Module):
-    def __init__(self, ncls, c=48, hidden=192):
+def render_multiline(lines, rng, force_surface=None):
+    w, lh, pad = 320, 64, 20
+    h = pad * 2 + len(lines) * lh
+    rgb, dark = make_surface(rng, w, h, force_surface or rng.choice(SURFACES))
+    mask = Image.new("L", (w, h), 0)
+    d = ImageDraw.Draw(mask)
+    for i, text in enumerate(lines):
+        font, size = pick_font(rng)
+        x, y = rng.randint(10, 34), pad + i * lh + (lh - size) // 2 - 2
+        draw_text(d, text, font, x, y, size, rng)
+    return augment(composite(mask, rgb, dark, rng, h, w), rng, rgb)
+
+
+# %% [markdown]
+# ## 3. CNN-классификатор символов и обучение
+# %%
+class CharNet(nn.Module):
+    def __init__(self, ncls, c=32):
         super().__init__()
-        self.cnn = nn.Sequential(
-            nn.Conv2d(1, c, 3, padding=1), nn.BatchNorm2d(c), nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
-            nn.Conv2d(c, c * 2, 3, padding=1), nn.BatchNorm2d(c * 2), nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
+        self.feat = nn.Sequential(
+            nn.Conv2d(1, c, 3, padding=1), nn.BatchNorm2d(c), nn.ReLU(inplace=True), nn.MaxPool2d(2),
+            nn.Conv2d(c, c * 2, 3, padding=1), nn.BatchNorm2d(c * 2), nn.ReLU(inplace=True), nn.MaxPool2d(2),
             nn.Conv2d(c * 2, c * 4, 3, padding=1), nn.BatchNorm2d(c * 4), nn.ReLU(inplace=True),
-            nn.Conv2d(c * 4, c * 4, 3, padding=1), nn.BatchNorm2d(c * 4), nn.ReLU(inplace=True),
-            nn.MaxPool2d((3, 1), (3, 1)),
-            nn.Conv2d(c * 4, c * 4, 3, padding=1), nn.BatchNorm2d(c * 4), nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((4, 4)),
         )
-        # Transformer вместо RNN: только matmul/LayerNorm/softmax,
-        # то есть 100% совместимо с XLA/TPU (у RNN на TPU бывают неподдерживаемые операции).
-        dim = c * 4
-        pe = torch.zeros(1, 512, dim)
-        pos = torch.arange(512).float().unsqueeze(1)
-        div = torch.exp(torch.arange(0, dim, 2).float() * -math.log(10000.0) / dim)
-        pe[0, :, 0::2] = torch.sin(pos * div)
-        pe[0, :, 1::2] = torch.cos(pos * div)
-        self.register_buffer("pe", pe)
-        layer = nn.TransformerEncoderLayer(d_model=dim, nhead=4,
-                                           dim_feedforward=hidden * 2,
-                                           dropout=0.1, activation="gelu",
-                                           batch_first=True)
-        self.enc = nn.TransformerEncoder(layer, num_layers=2)
-        self.head = nn.Linear(dim, ncls)
+        self.head = nn.Sequential(nn.Flatten(), nn.Linear(c * 4 * 16, 256), nn.ReLU(inplace=True),
+                                  nn.Dropout(0.2), nn.Linear(256, ncls))
 
     def forward(self, x):
-        f = self.cnn(x).mean(dim=2).permute(0, 2, 1)   # [B, T, C]
-        f = f + self.pe[:, :f.size(1), :]
-        z = self.enc(f)
-        return self.head(z).log_softmax(2)
+        return self.head(self.feat(x))
 
 
-model = CRNN(NCLS, CFG["c"], CFG["hidden"]).to(DEVICE)
+model = CharNet(NCLS, CFG["c"]).to(DEVICE)
+loader = DataLoader(CharDataset(CFG["n_train"], SEED + 1), batch_size=CFG["batch"],
+                    shuffle=True, num_workers=0, drop_last=False)
+opt = torch.optim.AdamW(model.parameters(), lr=CFG["lr"])
+sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=CFG["epochs"])
+print("Параметров модели:", sum(p.numel() for p in model.parameters()))
 
 
 def save_ckpt(path):
-    # На TPU state_dict содержит XLA-тензоры: явно переносим на CPU перед сохранением.
     sd = {k: v.detach().cpu() for k, v in model.state_dict().items()}
     torch.save(sd, path)
 
 
-print("Параметров модели:", sum(p.numel() for p in model.parameters()))
-print("Длина последовательности T = img_w/4 =", CFG["img_w"] // 4)
-
-
-# %% [markdown]
-# ## 3. Обучение
-# %%
-loader = DataLoader(LineDataset(CFG["n_train"], SEED + 1), batch_size=CFG["batch"],
-                    shuffle=True, collate_fn=collate, num_workers=0, drop_last=False)
-opt = torch.optim.AdamW(model.parameters(), lr=CFG["lr"])
-sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=CFG["epochs"])
-best_loss = float("inf")
-t0 = time.time()
-
+best, t0 = float("inf"), time.time()
 for ep in range(1, CFG["epochs"] + 1):
     model.train()
-    total, nb = 0.0, 0
-    for xs, ys, lens, _ in loader:
-        xs, ys, lens = xs.to(DEVICE), ys.to(DEVICE), lens.to(DEVICE)
+    tot, correct, seen = 0.0, 0, 0
+    for xs, ys in loader:
+        xs, ys = xs.to(DEVICE), ys.to(DEVICE)
         opt.zero_grad(set_to_none=True)
-        lp = model(xs)                                    # [B, T, NCLS]
-        T = lp.size(1)
-        inp_len = torch.full((xs.size(0),), T, dtype=torch.long, device=DEVICE)
-        loss = F.ctc_loss(lp.transpose(0, 1).contiguous(), ys, inp_len, lens,
-                          blank=BLANK, zero_infinity=True)
+        logits = model(xs)
+        loss = F.cross_entropy(logits, ys)
         loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), 5.0)
         opt.step()
         if DEVICE_KIND == "tpu":
             XM.mark_step()
-        total = total + loss.detach()
-        nb += 1
+        tot = tot + loss.detach()
+        correct = correct + (logits.argmax(1) == ys).sum().detach()
+        seen += ys.numel()
     sched.step()
-    val = float(total.cpu()) / max(1, nb) if torch.is_tensor(total) else total / max(1, nb)
-    if val < best_loss:
-        best_loss = val
-        save_ckpt(OUT / "ocr_crnn.pt")
-    print("эпоха %2d/%d  CTC loss = %.4f  lr = %.2e  t = %.1fs"
-          % (ep, CFG["epochs"], val, opt.param_groups[0]["lr"], time.time() - t0))
-
-print("Обучение заняло %.1f c. Лучший чекпоинт: %s" % (time.time() - t0, OUT / "ocr_crnn.pt"))
-model.load_state_dict(torch.load(OUT / "ocr_crnn.pt", map_location="cpu"))
+    l = float(tot.cpu()) / max(1, len(loader)) if torch.is_tensor(tot) else tot / max(1, len(loader))
+    acc = float(correct.cpu()) / max(1, seen)
+    if l < best:
+        best = l
+        save_ckpt(OUT / "char_cnn.pt")
+    print("эпоха %d/%d  loss=%.4f  symbol_acc=%.3f  t=%.1fs" % (ep, CFG["epochs"], l, acc, time.time() - t0))
+print("Обучение заняло %.1f c" % (time.time() - t0))
+model.load_state_dict(torch.load(OUT / "char_cnn.pt", map_location="cpu"))
 model.to(DEVICE)
+model.eval()
 
 
 # %% [markdown]
-# ## 4. Инференс: пробелы, сегментация строк, метрики
+# ## 4. Инференс: сегментация строк и символов, восстановление пробелов
 # %%
-def decode(logprobs):
-    path = logprobs[0].argmax(-1).cpu().numpy().tolist()
-    pairs, prev = [], -1
-    for t, idx in enumerate(path):
-        if idx != prev and idx != BLANK:
-            pairs.append((t, IDX2CHAR[idx]))
-        prev = idx
-    return "".join(ch for _, ch in pairs), pairs
+def ink_mask(gray, radius=18, pct=92):
+    im = gray.convert("L")
+    arr = np.asarray(im).astype(np.float32)
+    bg = np.asarray(im.filter(ImageFilter.GaussianBlur(radius))).astype(np.float32)
+    d = np.abs(arr - bg)
+    thr = float(np.clip(np.percentile(d, pct), 15, 80))
+    return d > thr
 
 
-def empty_runs(gray, min_len=None):
-    arr = np.asarray(gray.convert("L")).astype(np.float32)
-    bg = np.asarray(gray.convert("L").filter(ImageFilter.GaussianBlur(9))).astype(np.float32)
-    ink = np.abs(arr - bg) > 20
-    col = ink.sum(axis=0)
-    thr = max(1.0, 0.12 * float(col.max()))
-    empty = col < thr
-    W = len(empty)
-    if min_len is None:
-        min_len = max(4, int(W * 0.018))
-    runs, start = [], None
-    for i, v in enumerate(empty):
-        if v and start is None:
-            start = i
-        elif not v and start is not None:
-            if i - start >= min_len and start > 4 and i < W - 4:
-                runs.append((start, i))
-            start = None
-    return runs, W
-
-
-def enhance_spaces(text, pairs, gray, strength=True):
-    """Геометрическая подстраховка: длинные пустые колонки = пробел."""
-    if not strength or not pairs:
-        return text
-    runs, W = empty_runs(gray)
-    T = CFG["img_w"] // 4
-    out = list(text)
-    ins = set()
-    for s, e in runs:
-        gf = ((s + e) / 2) / W * T
-        k = sum(1 for t, _ in pairs if t < gf)
-        if k <= 0 or k >= len(out):
-            continue
-        if out[k - 1] == " " or out[k] == " ":
-            continue
-        ins.add(k)
-    for k in sorted(ins, reverse=True):
-        out.insert(k, " ")
-    return "".join(out)
-
-
-@torch.no_grad()
-def predict_line(gray, use_gaps=True):
-    model.eval()
-    lp = model(to_tensor(gray).to(DEVICE))
-    text, pairs = decode(lp)
-    return enhance_spaces(text, pairs, gray, use_gaps)
-
-
-def segment_lines(gray):
-    arr = np.asarray(gray.convert("L")).astype(np.float32)
-    bg = np.asarray(gray.convert("L").filter(ImageFilter.GaussianBlur(11))).astype(np.float32)
-    ink = np.abs(arr - bg) > 22
-    active = ink.sum(axis=1) > max(3, 0.02 * arr.shape[1])
-    groups, start = [], None
+def runs_of(active, min_len=1):
+    out, start = [], None
     for i, v in enumerate(active):
         if v and start is None:
             start = i
         elif not v and start is not None:
-            groups.append([start, i - 1])
+            if i - start >= min_len:
+                out.append([start, i - 1])
             start = None
-    if start is not None:
-        groups.append([start, len(active) - 1])
-    merged = []
-    for a, b in groups:
-        if merged and a - merged[-1][1] < 6:
-            merged[-1][1] = b
-        else:
-            merged.append([a, b])
-    out = []
-    for a, b in merged:
-        if b - a < 9:
-            continue
-        a, b = max(0, a - 5), min(arr.shape[0] - 1, b + 5)
-        out.append(gray.crop((0, a, arr.shape[1], b + 1)))
+    if start is not None and len(active) - start >= min_len:
+        out.append([start, len(active) - 1])
     return out
 
 
-def prep_crop(crop):
-    bw, bh = crop.size
-    nw = min(CFG["img_w"], max(1, int(bw * CFG["img_h"] / bh)))
-    r = crop.resize((nw, CFG["img_h"]), Image.BILINEAR)
-    bg = int(np.median(np.asarray(crop.convert("L"))))
-    canvas = Image.new("L", (CFG["img_w"], CFG["img_h"]), bg)
-    canvas.paste(r, (0, 0))
-    return canvas
+def merge_runs(runs, max_gap):
+    out = []
+    for a, b in runs:
+        if out and a - out[-1][1] <= max_gap:
+            out[-1][1] = b
+        else:
+            out.append([a, b])
+    return out
+
+
+def smooth(v, k):
+    return np.convolve(v, np.ones(k) / k, mode="same")
 
 
 @torch.no_grad()
-def predict_document(gray, use_gaps=True):
-    bands = segment_lines(gray)
-    return "\n".join(predict_line(prep_crop(b), use_gaps) for b in bands) if bands else ""
+def classify_crops(crops):
+    if not crops:
+        return []
+    x = torch.cat([norm_img(c) for c in crops], 0).unsqueeze(1).to(DEVICE)
+    preds = model(x).argmax(1).cpu().numpy().tolist()
+    return [IDX2CHAR[p] for p in preds]
+
+
+def segment_lines(gray):
+    m = ink_mask(gray, radius=22)
+    proj = smooth(m.sum(axis=1).astype(np.float32), 5)
+    active = proj > max(2.0, 0.15 * float(proj.max()))
+    groups = merge_runs(runs_of(active, 3), 6)
+    out = []
+    for a, b in groups:
+        if b - a < 10:
+            continue
+        a, b = max(0, a - 4), min(gray.height - 1, b + 4)
+        out.append(gray.crop((0, a, gray.width, b + 1)))
+    return out
+
+
+@torch.no_grad()
+def read_line(gray):
+    m = ink_mask(gray, radius=14)
+    col = smooth(m.sum(axis=0).astype(np.float32), 3)
+    active = col > max(2.0, 0.18 * float(col.max()))
+    groups = merge_runs(runs_of(active, 2), 2)
+    widths = [b - a + 1 for a, b in groups]
+    mw = float(np.median(widths)) if widths else 12.0
+    # Слишком широкие компоненты (слипшиеся буквы) режем на примерно равные части.
+    split = []
+    for a, b in groups:
+        w = b - a + 1
+        if w > 1.75 * mw:
+            n = max(2, int(round(w / mw)))
+            step = w / n
+            split += [[int(a + i * step), int(a + (i + 1) * step) - 1] for i in range(n)]
+        else:
+            split.append([a, b])
+    groups = [g for g in split if g[1] - g[0] >= 1]
+    if not groups:
+        return ""
+    crops = [gray.crop((max(0, a - 2), 0, min(gray.width, b + 3), gray.height)) for a, b in groups]
+    chars = classify_crops(crops)
+    space_thr = max(5.0, 0.48 * mw)
+    text = chars[0]
+    for i in range(1, len(groups)):
+        gap = groups[i][0] - groups[i - 1][1]
+        if gap > space_thr:
+            text += " "
+        text += chars[i]
+    return " ".join(text.split())
+
+
+@torch.no_grad()
+def predict_document(gray):
+    lines = segment_lines(gray)
+    return "\n".join(read_line(l) for l in lines) if lines else ""
 
 
 def edit_distance(a, b):
@@ -527,50 +482,42 @@ def norm(s):
 def score(gt, pred):
     g, p = norm(gt), norm(pred)
     cer = edit_distance(g, p) / max(1, len(g))
-    exact_words = g.split() == p.split()
+    wa = float(g.split() == p.split())
     gs = {i for i, ch in enumerate(g) if ch == " "}
     ps = {i for i, ch in enumerate(p) if ch == " "}
-    tp = len(gs & ps)
-    sf1 = 2 * tp / max(1, len(gs) + len(ps))
-    return cer, exact_words, sf1
-
-
-def evaluate(use_gaps, n=None, seed=99001, per_surface=False, surface=None):
-    n = n or CFG["n_val"]
-    rows = []
-    for i in range(n):
-        rng = R(seed + i * 104729)
-        surf = surface or (SURFACES[i % len(SURFACES)] if per_surface else None)
-        text = random_line(rng)
-        gray = render_line(text, rng, force_surface=surf)
-        pred = predict_line(gray, use_gaps)
-        rows.append((surf or "mixed", text, pred, *score(text, pred)))
-    return rows
+    sf1 = 2 * len(gs & ps) / max(1, len(gs) + len(ps))
+    return cer, wa, sf1
 
 
 def summarize(rows, label):
     cer = float(np.mean([r[3] for r in rows]))
-    wacc = float(np.mean([r[4] for r in rows]))
-    sf1 = float(np.mean([r[5] for r in rows]))
-    print("%-22s CER=%.4f  word_acc=%.3f  space_F1=%.3f  (n=%d)"
-          % (label, cer, wacc, sf1, len(rows)))
-    return dict(cer=cer, word_acc=wacc, space_f1=sf1, n=len(rows))
+    wa = float(np.mean([r[4] for r in rows]))
+    sf = float(np.mean([r[5] for r in rows]))
+    print("%-24s CER=%.4f  word_acc=%.3f  space_F1=%.3f  (n=%d)" % (label, cer, wa, sf, len(rows)))
+    return dict(cer=cer, word_acc=wa, space_f1=sf, n=len(rows))
 
 
 # %% [markdown]
-# ## 5. Автовыбор режима пробелов и полная проверка
+# ## 5. Проверка: поверхности, пробелы, многострочность
 # %%
-rows_off = evaluate(False, n=min(CFG["n_val"], 240))
-rows_on = evaluate(True, n=min(CFG["n_val"], 240))
-m_off, m_on = summarize(rows_off, "CTC без геометрии"), summarize(rows_on, "CTC + геометрия")
-USE_GAPS = m_on["cer"] < m_off["cer"] - 0.005
-print("Автовыбор режима пробелов:", "CTC + геометрия" if USE_GAPS else "только CTC")
-
-test_rows = evaluate(USE_GAPS, n=CFG["n_test"], seed=555001)
-test_m = summarize(test_rows, "ТЕСТ (смесь)")
+test_rows = []
+for i in range(CFG["n_test"]):
+    rng = R(555001 + i * 104729)
+    surf = SURFACES[i % len(SURFACES)]
+    text = random_line(rng)
+    pred = read_line(render_line(text, rng, force_surface=surf))
+    test_rows.append((surf, text, pred, *score(text, pred)))
+test_m = summarize(test_rows, "ТЕСТ (все поверхности)")
 by_surface = {}
 for idx, s in enumerate(SURFACES):
-    sub = evaluate(USE_GAPS, n=60, seed=6000 + idx * 101, surface=s)
+    sub = [r for r in test_rows if r[0] == s]
+    if not sub:
+        sub = []
+        for j in range(30):
+            rng = R(7000 + idx * 333 + j)
+            txt = random_line(rng)
+            sub.append((s, txt, read_line(render_line(txt, rng, force_surface=s)), 0, 0, 0))
+        sub = [(s, t, p, *score(t, p)) for s, t, p, *_ in sub]
     by_surface[s] = summarize(sub, "  поверхность: " + s)
 
 multi = []
@@ -579,10 +526,11 @@ for i in range(CFG["n_multiline"]):
     lines = [random_line(rng) for _ in range(rng.randint(2, 4))]
     gray = render_multiline(lines, rng, force_surface=SURFACES[i % len(SURFACES)])
     gt = "\n".join(lines)
-    pred = predict_document(gray, USE_GAPS)
+    pred = predict_document(gray)
     cer, wa, sf = score(gt, pred)
-    line_ok = pred.count("\n") + 1 == len(lines)
-    multi.append(dict(gt=gt, pred=pred, cer=cer, word_acc=wa, space_f1=sf, lines_ok=line_ok))
+    multi.append(dict(gt=gt, pred=pred, cer=cer, word_acc=wa, space_f1=sf,
+                      lines_ok=float(pred.count("\n") + 1 == len(lines)),
+                      detected=pred.count("\n") + 1))
 multi_m = dict(
     cer=float(np.mean([m["cer"] for m in multi])),
     word_acc=float(np.mean([m["word_acc"] for m in multi])),
@@ -594,34 +542,32 @@ print("МНОГОСТРОЧНЫЙ ТЕКСТ   CER=%.4f  word_acc=%.3f  space_F1
 
 
 # %% [markdown]
-# ## 6. Демо и сохранение результатов
+# ## 6. Демо, отчёт, сохранение модели
 # %%
 rng = R(20261109)
 demo_lines = ["The Medieval Warrior 2026", "level 7 boss fight", "TPU v5e 1 reads 42 words"]
 demo = render_multiline(demo_lines, rng, force_surface="stone")
-demo_pred = predict_document(demo, USE_GAPS)
+demo_pred = predict_document(demo)
 demo.save(OUT / "demo_multiline.png")
-print("--- ДЕМО: каменная поверхность, 3 строки ---")
+print("--- ДЕМО: камень, 3 строки ---")
 print("Эталон :", repr("\n".join(demo_lines)))
 print("Модель :", repr(demo_pred))
 print("Сегментировано строк:", len(segment_lines(demo)))
-
 for s in SURFACES:
-    rng = R(4242 + len(s))
-    txt = random_line(rng)
-    pred = predict_line(render_line(txt, rng, force_surface=s), USE_GAPS)
-    print("  %-11s %-34r -> %r" % (s, txt, pred))
+    r = R(4242 + len(s))
+    txt = random_line(r)
+    print("  %-11s %-34r -> %r" % (s, txt, read_line(render_line(txt, r, force_surface=s))))
 
 report = dict(
-    device=DEVICE_INFO, mode="smoke" if SMOKE else "full", config=CFG,
-    charsets=CHARS, params=sum(p.numel() for p in model.parameters()),
-    test=test_m, per_surface=by_surface, multiline=multi_m,
-    space_mode="ctc+geometry" if USE_GAPS else "ctc",
+    device=DEVICE_INFO, mode="smoke" if SMOKE else "full", config=CFG, charset=CHARS,
+    params=sum(p.numel() for p in model.parameters()), test=test_m,
+    per_surface=by_surface, multiline=multi_m,
     demo=dict(gt="\n".join(demo_lines), pred=demo_pred),
     examples=[dict(surface=r[0], gt=r[1], pred=r[2]) for r in test_rows[:12]],
+    multiline_examples=multi[:5],
 )
 (OUT / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-save_ckpt(OUT / "ocr_crnn.pt")
-print("\nГОТОВО. report.json, ocr_crnn.pt, demo_multiline.png ->", OUT)
+save_ckpt(OUT / "char_cnn.pt")
+print("\nГОТОВО. report.json, char_cnn.pt, demo_multiline.png ->", OUT)
 print("Итог: CER=%.4f | word_acc=%.3f | space_F1=%.3f | многострочность lines_ok=%.3f"
       % (test_m["cer"], test_m["word_acc"], test_m["space_f1"], multi_m["lines_ok"]))
