@@ -499,12 +499,12 @@ def score(gt, pred):
     return cer, exact_words, sf1
 
 
-def evaluate(use_gaps, n=None, seed=99001, per_surface=False):
+def evaluate(use_gaps, n=None, seed=99001, per_surface=False, surface=None):
     n = n or CFG["n_val"]
     rows = []
     for i in range(n):
         rng = R(seed + i * 104729)
-        surf = SURFACES[i % len(SURFACES)] if per_surface else None
+        surf = surface or (SURFACES[i % len(SURFACES)] if per_surface else None)
         text = random_line(rng)
         gray = render_line(text, rng, force_surface=surf)
         pred = predict_line(gray, use_gaps)
@@ -533,8 +533,8 @@ print("Автовыбор режима пробелов:", "CTC + геометр
 test_rows = evaluate(USE_GAPS, n=CFG["n_test"], seed=555001)
 test_m = summarize(test_rows, "ТЕСТ (смесь)")
 by_surface = {}
-for s in SURFACES:
-    sub = [r for r in test_rows if r[0] == s] or evaluate(USE_GAPS, n=60, seed=hash(s) % 100000, per_surface=True)
+for idx, s in enumerate(SURFACES):
+    sub = evaluate(USE_GAPS, n=60, seed=6000 + idx * 101, surface=s)
     by_surface[s] = summarize(sub, "  поверхность: " + s)
 
 multi = []
