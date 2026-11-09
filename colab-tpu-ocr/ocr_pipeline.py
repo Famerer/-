@@ -241,7 +241,14 @@ def render_char(ch, rng, clean=False):
     d.text((x, y), ch, font=font, fill=255, anchor="lt",
            stroke_width=1 if rng.random() < 0.3 else 0, stroke_fill=255)
     im = composite(mask, rgb, dark, rng, S, S)
-    return im.convert("L") if clean else augment(im, rng, rgb, strong=True)
+    im = im.convert("L") if clean else augment(im, rng, rgb, strong=True)
+    # Обрезаем по реальным границам символа: в инференсе кропы тоже «плотные»,
+    # поэтому обучающее и боевое распределения совпадают.
+    bb = mask.getbbox()
+    if bb:
+        x0, y0, x1, y1 = bb
+        im = im.crop((max(0, x0 - 3), max(0, y0 - 3), min(S, x1 + 3), min(S, y1 + 3)))
+    return im
 
 
 def norm_img(gray, size=32, pad_value=None):
@@ -430,10 +437,19 @@ def segment_lines(gray):
 def read_line(gray):
     m = ink_mask(gray, radius=14)
     col = smooth(m.sum(axis=0).astype(np.float32), 3)
-    active = col > max(2.0, 0.18 * float(col.max()))
-    groups = merge_runs(runs_of(active, 2), 2)
-    widths = [b - a + 1 for a, b in groups]
-    mw = float(np.median(widths)) if widths else 12.0
+    active = col > max(3.0, 0.15 * float(col.max()))
+    raw = merge_runs(runs_of(active, 3), 3)
+    # Отсечь шумовые колонки: в настоящем символе чернил заметно больше.
+    groups = []
+    for a, b in raw:
+        sub = m[:, a:b + 1]
+        if float(sub.sum()) >= max(3.0, 0.10 * sub.size):
+            groups.append([a, b])
+    # Ожидаемую ширину буквы берём из высоты строки чернил, а не из медианы групп:
+    # при шуме/разрывах медиана Groups занижается и начинает резать каждую букву.
+    rr = np.where(m.sum(axis=1) > 0)[0]
+    h_ink = float(rr[-1] - rr[0] + 1) if len(rr) else float(gray.height)
+    mw = max(7.0, 0.55 * h_ink)
     # Слишком широкие компоненты (слипшиеся буквы) режем на примерно равные части.
     split = []
     for a, b in groups:
@@ -447,7 +463,14 @@ def read_line(gray):
     groups = [g for g in split if g[1] - g[0] >= 1]
     if not groups:
         return ""
-    crops = [gray.crop((max(0, a - 2), 0, min(gray.width, b + 3), gray.height)) for a, b in groups]
+    # Берём не всю полосу строки, а вертикальные границы чернил именно этой буквы:
+    # так масштаб символа совпадает с тем, на котором обучалась сеть.
+    crops = []
+    for a, b in groups:
+        rows = np.where(m[:, a:b + 1].sum(axis=1) > 0)[0]
+        y0 = max(0, int(rows[0]) - 2) if len(rows) else 0
+        y1 = min(gray.height, int(rows[-1]) + 3) if len(rows) else gray.height
+        crops.append(gray.crop((max(0, a - 2), y0, min(gray.width, b + 3), y1)))
     chars = classify_crops(crops)
     space_thr = max(5.0, 0.48 * mw)
     text = chars[0]
