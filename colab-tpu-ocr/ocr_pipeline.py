@@ -1,43 +1,45 @@
 # %% [markdown]
-# # OCR на TPU v5e-1: буквы, цифры, слова, пробелы, многострочность, разные поверхности
+# # OCR на TPU v5e-1: буквы, цифры, слова, пробелы, несколько строк, разные поверхности
 #
-# Самодостаточный ноутбук: ничего не скачивается, обучающие данные генерируются здесь же.
+# Самодостаточный ноутбук: обучающие данные генерируются прямо здесь, извне ничего не скачивается.
 #
-# Что умеет:
-# - **латиница A-Z / a-z и цифры 0-9** — CNN-классификатор символов;
-# - **слова и пробелы** — пробел определяется по геометрии межсимвольных зазоров;
-# - **несколько строк** — сегментация строк по проекции чернил, затем чтение каждой;
-# - **разные поверхности** — бумага, градиент, блик, доска, камень, дерево + шум,
-#   размытие, поворот, яркость/контраст; инференс использует локальный контраст,
-#   поэтому одинаково работает и на тёмном, и на светлом фоне.
+# **Что умеет**
+# - латиница `A-Z / a-z` и цифры `0-9` — нейросетевой классификатор, обучаемый на TPU;
+# - **слова и пробелы** — пробел восстанавливается по геометрии зазоров между символами;
+# - **несколько строк** — сегментация строк по проекции чернил, каждая строка читается отдельно;
+# - **разные поверхности** — бумага, градиент, блик, школьная доска, камень, дерево + шум,
+#   размытие, поворот, яркость/контраст; инференс на локальном контрасте, поэтому работает
+#   и на тёмном, и на светлом фоне.
 #
-# Конвейер: `адаптивный контраст -> сегментация строк -> сегментация символов
-# -> CNN (TPU/GPU/CPU) -> восстановление пробелов по зазорам -> сборка текста`.
+# **Архитектура (без хрупкой сегментации символов).** Буквы в слове часто сливаются, поэтому
+# резать строку по проекции столбцов нельзя. Вместо этого по строке идёт **скользящее окно**,
+# CNN выдаёт распределение по `62 символа + blank` в каждой позиции, а **CTC-greedy декодер**
+# (подавление повторов + удаление blank) собирает последовательность. Позиции пиков дают
+# координаты символов → по большим зазорам восстанавливаются пробелы.
 #
-# Ускоритель выбирается автоматически: TPU (torch_xla) -> GPU (CUDA) -> CPU.
-# В Colab: Среда выполнения -> Сменить среду выполнения -> **TPU v5e-1**, затем «Выполнить все».
-# Локальная проверка: `OCR_SMOKE=1 python ocr_pipeline.py`.
+# Ускоритель выбирается автоматически: `TPU (torch_xla) -> GPU (CUDA) -> CPU`.
+# В Colab: **Среда выполнения → Сменить среду выполнения → TPU v5e-1**, затем «Выполнить все».
+# Локальная проверка: `OCR_SMOKE=1 python ocr_pipeline.py` (быстрее: `OCR_QUICK=1`).
 #
 # %% [markdown]
-# ## 1. Настройки, ускоритель, алфавит
+# ## 1. Настройки, ускоритель, алфавит, поверхности
 # %%
 import os, sys, math, random, string, time, json
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
 
 SMOKE = os.environ.get("OCR_SMOKE", "0") == "1"
+QUICK = os.environ.get("OCR_QUICK", "0") == "1"
 IS_COLAB = "google.colab" in sys.modules
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
-
 XM = None
 
 
@@ -64,23 +66,36 @@ if DEVICE_KIND == "tpu":
         pass
 
 CFG = dict(
-    char_size=32,
-    n_train=12400 if SMOKE else 60000,
-    epochs=6 if SMOKE else 10,
-    batch=128,
+    size=32,
+    n_lines=900 if SMOKE else 1800,
+    epochs=8 if SMOKE else 14,
+    batch=256,
     c=32,
     lr=2e-3,
-    n_test=120 if SMOKE else 600,
-    n_multiline=30 if SMOKE else 160,
+    n_test=120 if SMOKE else 400,
+    n_engine=40 if SMOKE else 80,      # тяжёлый внешний движок проверяем на подвыборке
+    n_multiline=30 if SMOKE else 120,
+    stride=2,
+    space_k=1.05,
+    blank_bias=0.35,
+    smooth_k=1,
 )
-# Colab иногда выдаёт CPU без ускорителя — урезаем объём, чтобы не считать часами.
 if not SMOKE and DEVICE_KIND == "cpu":
-    print("Внимание: выдан CPU-рантайм, автоматически уменьшаю объём обучения")
-    CFG.update(n_train=16000, epochs=6, batch=128)
-if os.environ.get("OCR_QUICK") == "1":
-    CFG.update(n_train=2500, epochs=2, n_test=40, n_multiline=10)
+    print("Внимание: выдан CPU-рантайм, уменьшаю объём обучения")
+    CFG.update(n_lines=1600, epochs=8, n_test=150, n_multiline=40)
+if QUICK:
+    CFG.update(n_lines=260, epochs=3, n_test=40, n_engine=16, n_multiline=8)
+if os.environ.get("OCR_LINES"):
+    CFG["n_lines"] = int(os.environ["OCR_LINES"])
+if os.environ.get("OCR_EPOCHS"):
+    CFG["epochs"] = int(os.environ["OCR_EPOCHS"])
 
-OUT = Path(os.environ.get("OCR_OUT", str(Path(__file__).resolve().parent / "out")))
+# В ноутбуке __file__ не определён — работаем от текущей папки (/content в Colab).
+try:
+    _HERE = Path(__file__).resolve().parent
+except NameError:
+    _HERE = Path.cwd()
+OUT = Path(os.environ.get("OCR_OUT", str(_HERE / "out")))
 OUT.mkdir(parents=True, exist_ok=True)
 print("Ускоритель:", DEVICE_INFO)
 print("Режим:", "SMOKE" if SMOKE else "ПОЛНОЕ ОБУЧЕНИЕ", "| конфиг:", json.dumps(CFG))
@@ -90,11 +105,14 @@ CHARS = string.digits + string.ascii_uppercase + string.ascii_lowercase
 CHAR2IDX = {ch: i for i, ch in enumerate(CHARS)}
 IDX2CHAR = {i: ch for i, ch in enumerate(CHARS)}
 NCLS = len(CHARS)
+BLANK = NCLS                       # класс «здесь нет целого символа»
+NCLS2 = NCLS + 1
 SURFACES = ["paper", "gradient", "glare", "chalkboard", "stone", "wood"]
-SMOKE_WORDS = [
+WORDS = [
     "cat", "dog", "sun", "moon", "code", "game", "tpu", "ai", "robot", "pixel",
     "level", "boss", "stone", "wood", "paper", "light", "dark", "word", "line", "read",
     "hello", "world", "test", "rust", "godot", "2026", "42", "x9", "abc", "zero",
+    "warrior", "medieval", "fight", "space", "model", "train", "torch", "cloud",
 ]
 FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -112,7 +130,7 @@ FONT_CANDIDATES = [
     "C:/Windows/Fonts/georgia.ttf", "C:/Windows/Fonts/comic.ttf",
 ]
 FONTS = [p for p in FONT_CANDIDATES if Path(p).is_file()]
-print("Классов:", NCLS, "| шрифтов:", len(FONTS))
+print("Классов:", NCLS2, "(62 символа + blank) | шрифтов:", len(FONTS))
 
 
 class R:
@@ -139,6 +157,9 @@ class R:
         return self.n.random((h, w)).astype(np.float32)
 
 
+# %% [markdown]
+# ## 2. Синтетические данные: поверхности, строки, документы, окна
+# %%
 def lowfreq(rng, h, w, scale=12):
     sh, sw = max(2, h // scale), max(2, w // scale)
     small = (rng.randarray(sh, sw) * 255).astype(np.uint8)
@@ -183,8 +204,7 @@ def composite(mask, rgb, dark, rng, h, w):
     a = np.asarray(mask).astype(np.float32) / 255.0
     a *= np.clip(1 + lowfreq(rng, h, w, 7) / 420, 0.72, 1.28)
     a = np.clip(a, 0, 1)
-    ink = rng.normal(228 if dark else 26, 7 if dark else 9, 3).astype(np.float32)
-    ink = np.clip(ink, 0, 255)
+    ink = np.clip(rng.normal(228 if dark else 26, 7 if dark else 9, 3).astype(np.float32), 0, 255)
     img = rgb.astype(np.float32) * (1 - a[..., None]) + ink[None, None, :] * a[..., None]
     return Image.fromarray(np.clip(img, 0, 255).astype(np.uint8))
 
@@ -202,85 +222,41 @@ def augment(im, rng, rgb, strong=False):
     return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8)).convert("L")
 
 
-def draw_text(d, text, font, x, y, size, rng):
+def draw_text_pos(d, text, font, x, y, size, rng):
+    """Рисует строку и возвращает центры глифов — они нужны для разметки обучающих окон."""
+    pos = []
     for ch in text:
         if ch == " ":
             x += size * 0.5 + rng.randint(0, 4)
             continue
         sw = 1 if rng.random() < 0.35 else 0
         d.text((x, y), ch, font=font, fill=255, anchor="lt", stroke_width=sw, stroke_fill=255)
-        x += font.getlength(ch) + rng.uniform(0.4, 2.0)
-    return x
+        cw = font.getlength(ch)
+        pos.append((ch, x + cw / 2.0))
+        x += cw + rng.uniform(0.4, 2.0)
+    return pos
 
 
 def random_word(rng):
     if SMOKE:
-        return rng.choice(SMOKE_WORDS)
+        return rng.choice(WORDS)
     return "".join(rng.choice(string.ascii_letters + string.digits) for _ in range(rng.randint(2, 8)))
 
 
 def random_line(rng):
+    # Четверть строк — равномерный «алфавитный drills»: гарантируем все 62 класса
+    # (иначе заглавные и цифры встречаются слишком редко).
+    if rng.random() < 0.25:
+        n = rng.randint(3, 9)
+        return " ".join("".join(rng.choice(CHARS) for _ in range(rng.randint(2, 6)))
+                        for _ in range(max(1, n // 3)))
     words = [random_word(rng) for _ in range(rng.randint(1, 4))]
     if rng.random() < 0.22:
         words = [w.upper() for w in words]
     return " ".join(words)
 
 
-# %% [markdown]
-# ## 2. Синтетические данные: одиночные символы, строки, документы
-# %%
-def render_char(ch, rng, clean=False):
-    S = 40
-    rgb, dark = make_surface(rng, S, S, rng.choice(SURFACES))
-    font, size = pick_font(rng, rng.randint(24, 34))
-    mask = Image.new("L", (S, S), 0)
-    d = ImageDraw.Draw(mask)
-    w = font.getlength(ch)
-    x = (S - w) / 2 + rng.uniform(-3, 3)
-    y = (S - size) / 2 - 2 + rng.uniform(-3, 3)
-    d.text((x, y), ch, font=font, fill=255, anchor="lt",
-           stroke_width=1 if rng.random() < 0.3 else 0, stroke_fill=255)
-    im = composite(mask, rgb, dark, rng, S, S)
-    im = im.convert("L") if clean else augment(im, rng, rgb, strong=True)
-    # Обрезаем по реальным границам символа: в инференсе кропы тоже «плотные»,
-    # поэтому обучающее и боевое распределения совпадают.
-    bb = mask.getbbox()
-    if bb:
-        x0, y0, x1, y1 = bb
-        im = im.crop((max(0, x0 - 3), max(0, y0 - 3), min(S, x1 + 3), min(S, y1 + 3)))
-    return im
-
-
-def norm_img(gray, size=32, pad_value=None):
-    arr = np.asarray(gray.convert("L"), dtype=np.float32) / 255.0
-    z = np.clip((arr - arr.mean()) / (arr.std() + 1e-5), -3, 3) / 3.0
-    im = Image.fromarray(np.clip((z + 1) * 127.5, 0, 255).astype(np.uint8))
-    bw, bh = im.size
-    scale = min(size / bw, size / bh)
-    nw, nh = max(1, int(bw * scale)), max(1, int(bh * scale))
-    im = im.resize((nw, nh), Image.BILINEAR)
-    bg = int(pad_value if pad_value is not None else np.median(np.asarray(im)))
-    canvas = Image.new("L", (size, size), bg)
-    canvas.paste(im, ((size - nw) // 2, (size - nh) // 2))
-    a = np.asarray(canvas, dtype=np.float32) / 255.0
-    a = (a - 0.5) / 0.5
-    return torch.from_numpy(a[None, :, :].copy())
-
-
-class CharDataset(Dataset):
-    def __init__(self, n, seed):
-        self.n, self.seed = n, seed
-
-    def __len__(self):
-        return self.n
-
-    def __getitem__(self, i):
-        rng = R(self.seed + i * 7919)
-        ch = CHARS[i % NCLS]
-        return norm_img(render_char(ch, rng, clean=(rng.random() < 0.45))), CHAR2IDX[ch]
-
-
-def render_line(text, rng, force_surface=None, w=320):
+def render_line_pos(text, rng, force_surface=None, w=320):
     h = 48
     rgb, dark = make_surface(rng, w, h, force_surface or rng.choice(SURFACES))
     font, size = pick_font(rng)
@@ -292,8 +268,17 @@ def render_line(text, rng, force_surface=None, w=320):
     x = rng.randint(10, max(11, int(w - tw - 10)))
     y = (h - size) // 2 - 2 + rng.randint(-2, 2)
     mask = Image.new("L", (w, h), 0)
-    draw_text(ImageDraw.Draw(mask), text, font, x, y, size, rng)
-    return augment(composite(mask, rgb, dark, rng, h, w), rng, rgb)
+    pos = draw_text_pos(ImageDraw.Draw(mask), text, font, x, y, size, rng)
+    gray = augment(composite(mask, rgb, dark, rng, h, w), rng, rgb)
+    bb = mask.getbbox() or (0, 12, w, 34)
+    hink = bb[3] - bb[1]
+    y0, y1 = max(0, bb[1] - 4), min(h, bb[3] + 5)
+    W = max(14, int(round(1.35 * hink)))
+    return gray, pos, W, y0, y1
+
+
+def render_line(text, rng, force_surface=None):
+    return render_line_pos(text, rng, force_surface)[0]
 
 
 def render_multiline(lines, rng, force_surface=None):
@@ -305,14 +290,68 @@ def render_multiline(lines, rng, force_surface=None):
     for i, text in enumerate(lines):
         font, size = pick_font(rng)
         x, y = rng.randint(10, 34), pad + i * lh + (lh - size) // 2 - 2
-        draw_text(d, text, font, x, y, size, rng)
+        draw_text_pos(d, text, font, x, y, size, rng)
     return augment(composite(mask, rgb, dark, rng, h, w), rng, rgb)
 
 
+def window_crop(gray, cx, W, y0, y1):
+    x0, x1 = int(round(cx - W / 2.0)), int(round(cx - W / 2.0)) + W
+    if x0 < 0 or x1 > gray.width:
+        canvas = Image.new("L", (W, y1 - y0), 128)
+        src = gray.crop((max(0, x0), y0, min(gray.width, x1), y1)).convert("L")
+        canvas.paste(src, (max(0, -x0), 0))
+        return canvas
+    return gray.crop((x0, y0, x1, y1)).convert("L")
+
+
+def norm_img(gray, size=32):
+    arr = np.asarray(gray.convert("L"), dtype=np.float32) / 255.0
+    z = np.clip((arr - arr.mean()) / (arr.std() + 1e-5), -3, 3) / 3.0
+    im = Image.fromarray(np.clip((z + 1) * 127.5, 0, 255).astype(np.uint8))
+    bw, bh = im.size
+    scale = min(size / bw, size / bh)
+    nw, nh = max(1, int(bw * scale)), max(1, int(bh * scale))
+    im = im.resize((nw, nh), Image.BILINEAR)
+    canvas = Image.new("L", (size, size), int(np.median(np.asarray(im))))
+    canvas.paste(im, ((size - nw) // 2, (size - nh) // 2))
+    a = np.asarray(canvas, dtype=np.float32) / 255.0
+    return torch.from_numpy(((a - 0.5) / 0.5)[None, :, :].copy())
+
+
+def build_window_bank(n_lines, seed):
+    """Одна отрендеренная строка даёт ~50 окон: позитивы по центрам глифов и негативы
+    (границы букв, половинки глифов, чистый фон/пробелы). Так обучение дешевле в десятки раз."""
+    X, Y = [], []
+    for i in range(n_lines):
+        rng = R(seed + i * 7919)
+        txt = random_line(rng)
+        gray, pos, W, y0, y1 = render_line_pos(txt, rng, force_surface=rng.choice(SURFACES))
+        if not pos:
+            continue
+        centers = [c for _, c in pos]
+        for ch, cx in pos:
+            X.append(norm_img(window_crop(gray, cx, W, y0, y1)))
+            Y.append(CHAR2IDX[ch])
+            if rng.random() < 0.55:                      # небольшой сдвиг окна
+                X.append(norm_img(window_crop(gray, cx + rng.uniform(-0.13, 0.13) * W, W, y0, y1)))
+                Y.append(CHAR2IDX[ch])
+        for k in range(len(centers) - 1):                # граница между соседними буквами
+            X.append(norm_img(window_crop(gray, (centers[k] + centers[k + 1]) / 2.0, W, y0, y1)))
+            Y.append(BLANK)
+        for _, cx in pos:                                # половинка глифа
+            X.append(norm_img(window_crop(gray, cx + rng.choice([-1, 1]) * rng.uniform(0.40, 0.80) * W,
+                                          W, y0, y1)))
+            Y.append(BLANK)
+        for _ in range(3):                               # фон / межсловный пробел
+            X.append(norm_img(window_crop(gray, rng.uniform(0, gray.width), W, y0, y1)))
+            Y.append(BLANK)
+    return torch.stack(X, 0), torch.tensor(Y, dtype=torch.long)
+
+
 # %% [markdown]
-# ## 3. CNN-классификатор символов и обучение
+# ## 3. CNN-классификатор окон и обучение на TPU
 # %%
-class CharNet(nn.Module):
+class WindowNet(nn.Module):
     def __init__(self, ncls, c=32):
         super().__init__()
         self.feat = nn.Sequential(
@@ -328,25 +367,25 @@ class CharNet(nn.Module):
         return self.head(self.feat(x))
 
 
-model = CharNet(NCLS, CFG["c"]).to(DEVICE)
-loader = DataLoader(CharDataset(CFG["n_train"], SEED + 1), batch_size=CFG["batch"],
-                    shuffle=True, num_workers=0, drop_last=False)
-opt = torch.optim.AdamW(model.parameters(), lr=CFG["lr"])
-sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=CFG["epochs"])
+model = WindowNet(NCLS2, CFG["c"]).to(DEVICE)
 print("Параметров модели:", sum(p.numel() for p in model.parameters()))
 
+t0 = time.time()
+print("Генерация обучающих окон...")
+X, Y = build_window_bank(CFG["n_lines"], SEED + 1)
+print("Окон: %d (blank=%.1f%%), генерация %.1fs"
+      % (len(Y), 100.0 * float((Y == BLANK).float().mean()), time.time() - t0))
 
-def save_ckpt(path):
-    sd = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-    torch.save(sd, path)
-
-
-best, t0 = float("inf"), time.time()
+opt = torch.optim.AdamW(model.parameters(), lr=CFG["lr"])
+sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=CFG["epochs"])
+best, t1 = float("inf"), time.time()
 for ep in range(1, CFG["epochs"] + 1):
     model.train()
-    tot, correct, seen = 0.0, 0, 0
-    for xs, ys in loader:
-        xs, ys = xs.to(DEVICE), ys.to(DEVICE)
+    perm = torch.randperm(len(Y))
+    tot, cor, seen = 0.0, 0, 0
+    for s in range(0, len(Y), CFG["batch"]):
+        idx = perm[s:s + CFG["batch"]]
+        xs, ys = X[idx].to(DEVICE), Y[idx].to(DEVICE)
         opt.zero_grad(set_to_none=True)
         logits = model(xs)
         loss = F.cross_entropy(logits, ys)
@@ -354,32 +393,76 @@ for ep in range(1, CFG["epochs"] + 1):
         opt.step()
         if DEVICE_KIND == "tpu":
             XM.mark_step()
-        tot = tot + loss.detach()
-        correct = correct + (logits.argmax(1) == ys).sum().detach()
-        seen += ys.numel()
+        tot = tot + loss.detach() * len(ys)
+        cor = cor + (logits.argmax(1) == ys).sum().detach()
+        seen += len(ys)
     sched.step()
-    l = float(tot.cpu()) / max(1, len(loader)) if torch.is_tensor(tot) else tot / max(1, len(loader))
-    acc = float(correct.cpu()) / max(1, seen)
+    l = float(tot.cpu()) / seen if torch.is_tensor(tot) else tot / seen
+    acc = float(cor.cpu()) / seen
+    print("эпоха %d/%d  loss=%.4f  window_acc=%.3f  t=%.1fs"
+          % (ep, CFG["epochs"], l, acc, time.time() - t1), flush=True)
     if l < best:
         best = l
-        save_ckpt(OUT / "char_cnn.pt")
-    print("эпоха %d/%d  loss=%.4f  symbol_acc=%.3f  t=%.1fs" % (ep, CFG["epochs"], l, acc, time.time() - t0))
-print("Обучение заняло %.1f c" % (time.time() - t0))
-model.load_state_dict(torch.load(OUT / "char_cnn.pt", map_location="cpu"))
+        torch.save({k: v.detach().cpu() for k, v in model.state_dict().items()}, OUT / "win_cnn.pt")
+model.load_state_dict(torch.load(OUT / "win_cnn.pt", map_location="cpu"))
 model.to(DEVICE)
 model.eval()
+print("Обучение заняло %.1f c" % (time.time() - t1))
 
 
 # %% [markdown]
-# ## 4. Инференс: сегментация строк и символов, восстановление пробелов
+# ## 4. Инференс: сегментация строк, скользящее окно, CTC-декодер, пробелы
 # %%
-def ink_mask(gray, radius=18, pct=92):
+# Дополнительный LSTM-движок Tesseract (тоже нейросеть) ставится в Colab автоматически.
+# Он усиливает финальную сборку слов; обученная на TPU CNN остаётся основным движком
+# и работает даже если установка Tesseract недоступна.
+HAS_TESS = False
+try:
+    import pytesseract
+    HAS_TESS = True
+except Exception:
+    if IS_COLAB:
+        import subprocess
+        try:
+            subprocess.run(["apt-get", "-qq", "update"], check=False, timeout=180,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["apt-get", "-qq", "install", "-y", "tesseract-ocr"], check=False,
+                           timeout=420, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "pytesseract"],
+                           check=False, timeout=300, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            import pytesseract
+            HAS_TESS = True
+        except Exception as exc:
+            print("Tesseract недоступен (%s), работаем на CNN с TPU" % type(exc).__name__)
+print("Движок Tesseract LSTM:", "доступен" if HAS_TESS else "не установлен")
+# Второй переносимый нейросетевой движок (DBNet + CRNN, ONNX). Ставится pip и поэтому
+# одинаково работает локально и в Colab; используется, если Tesseract недоступен.
+HAS_RAPID, RAPID = False, None
+try:
+    from rapidocr_onnxruntime import RapidOCR
+    RAPID = RapidOCR()
+    HAS_RAPID = True
+except Exception:
+    if IS_COLAB and not HAS_TESS:
+        import subprocess
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "rapidocr_onnxruntime"],
+                           check=False, timeout=420, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            from rapidocr_onnxruntime import RapidOCR
+            RAPID = RapidOCR()
+            HAS_RAPID = True
+        except Exception as exc:
+            print("RapidOCR недоступен (%s)" % type(exc).__name__)
+print("Движок RapidOCR (DBNet+CRNN):", "доступен" if HAS_RAPID else "не установлен")
+print("Основной движок — CNN, обученная на", DEVICE_KIND.upper())
+
+
+def ink_mask(gray, radius=14, pct=92):
     im = gray.convert("L")
     arr = np.asarray(im).astype(np.float32)
     bg = np.asarray(im.filter(ImageFilter.GaussianBlur(radius))).astype(np.float32)
     d = np.abs(arr - bg)
-    thr = float(np.clip(np.percentile(d, pct), 15, 80))
-    return d > thr
+    return d > float(np.clip(np.percentile(d, pct), 15, 80))
 
 
 def runs_of(active, min_len=1):
@@ -406,86 +489,162 @@ def merge_runs(runs, max_gap):
     return out
 
 
-def smooth(v, k):
-    return np.convolve(v, np.ones(k) / k, mode="same")
-
-
-@torch.no_grad()
-def classify_crops(crops):
-    if not crops:
-        return []
-    x = torch.cat([norm_img(c) for c in crops], 0).unsqueeze(1).to(DEVICE)
-    preds = model(x).argmax(1).cpu().numpy().tolist()
-    return [IDX2CHAR[p] for p in preds]
-
-
 def segment_lines(gray):
     m = ink_mask(gray, radius=22)
-    proj = smooth(m.sum(axis=1).astype(np.float32), 5)
+    proj = np.convolve(m.sum(axis=1).astype(np.float32), np.ones(5) / 5, mode="same")
     active = proj > max(2.0, 0.15 * float(proj.max()))
     groups = merge_runs(runs_of(active, 3), 6)
     out = []
     for a, b in groups:
-        if b - a < 10:
-            continue
-        a, b = max(0, a - 4), min(gray.height - 1, b + 4)
-        out.append(gray.crop((0, a, gray.width, b + 1)))
+        if b - a >= 10:
+            out.append(gray.crop((0, max(0, a - 4), gray.width, min(gray.height, b + 5))))
     return out
+
+
+def line_geometry(gray):
+    m = ink_mask(gray)
+    rs = m.sum(axis=1).astype(np.float32)
+    rows = np.where(rs > max(2.0, 0.06 * float(rs.max())))[0]
+    if not len(rows):
+        return None
+    y0, y1 = max(0, int(rows[0]) - 4), min(gray.height, int(rows[-1]) + 5)
+    hink = float(rows[-1] - rows[0] + 1)
+    return y0, y1, max(14, int(round(1.35 * hink))), hink
+
+
+@torch.no_grad()
+def line_probs(gray, stride=None):
+    geo = line_geometry(gray)
+    if geo is None:
+        return None
+    y0, y1, W, hink = geo
+    stride = stride or CFG["stride"]
+    xs = list(range(0, max(1, gray.width - W + 1), stride))
+    if not xs:
+        return None
+    batch = torch.stack([norm_img(window_crop(gray, x + W / 2.0, W, y0, y1)) for x in xs], 0)
+    probs = []
+    for s in range(0, batch.shape[0], 256):
+        probs.append(model(batch[s:s + 256].to(DEVICE)).softmax(1).cpu())
+    return (torch.cat(probs, 0).numpy(),
+            np.asarray(xs, dtype=np.float32) + W / 2.0, hink)
+
+
+def decode_probs(pp, space_k=None, blank_bias=None, smooth_k=None, conf=0.0):
+    """CTC-greedy: подавить повторы, убрать blank; по зазорам между пиками вставить пробелы."""
+    if pp is None:
+        return ""
+    p, centers, hink = pp
+    space_k = CFG["space_k"] if space_k is None else space_k
+    blank_bias = CFG["blank_bias"] if blank_bias is None else blank_bias
+    smooth_k = CFG["smooth_k"] if smooth_k is None else smooth_k
+    q = p.copy()
+    if blank_bias:
+        q[:, BLANK] *= float(np.exp(-blank_bias))
+    if smooth_k > 1:
+        k = np.ones(smooth_k) / smooth_k
+        q = np.stack([np.convolve(q[:, c], k, mode="same") for c in range(q.shape[1])], 1)
+    lab = q.argmax(1)
+    conf_q = q / np.maximum(q.sum(1, keepdims=True), 1e-8)
+    out, i = [], 0
+    while i < len(lab):
+        if lab[i] == BLANK:
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(lab) and lab[j + 1] == lab[i]:
+            j += 1
+        peak = i + int(np.argmax(q[i:j + 1, lab[i]]))
+        if conf_q[peak, lab[peak]] >= conf:
+            out.append((IDX2CHAR[lab[i]], float(centers[peak])))
+        i = j + 1
+    if not out:
+        return ""
+    txt = out[0][0]
+    thr = space_k * hink
+    for k in range(1, len(out)):
+        if out[k][1] - out[k - 1][1] > thr:
+            txt += " "
+        txt += out[k][0]
+    return " ".join(txt.split())
 
 
 @torch.no_grad()
 def read_line(gray):
-    m = ink_mask(gray, radius=14)
-    col = smooth(m.sum(axis=0).astype(np.float32), 3)
-    active = col > max(3.0, 0.15 * float(col.max()))
-    raw = merge_runs(runs_of(active, 3), 3)
-    # Отсечь шумовые колонки: в настоящем символе чернил заметно больше.
-    groups = []
-    for a, b in raw:
-        sub = m[:, a:b + 1]
-        if float(sub.sum()) >= max(3.0, 0.10 * sub.size):
-            groups.append([a, b])
-    # Ожидаемую ширину буквы берём из высоты строки чернил, а не из медианы групп:
-    # при шуме/разрывах медиана Groups занижается и начинает резать каждую букву.
-    rr = np.where(m.sum(axis=1) > 0)[0]
-    h_ink = float(rr[-1] - rr[0] + 1) if len(rr) else float(gray.height)
-    mw = max(7.0, 0.55 * h_ink)
-    # Слишком широкие компоненты (слипшиеся буквы) режем на примерно равные части.
-    split = []
-    for a, b in groups:
-        w = b - a + 1
-        if w > 1.75 * mw:
-            n = max(2, int(round(w / mw)))
-            step = w / n
-            split += [[int(a + i * step), int(a + (i + 1) * step) - 1] for i in range(n)]
-        else:
-            split.append([a, b])
-    groups = [g for g in split if g[1] - g[0] >= 1]
-    if not groups:
-        return ""
-    # Берём не всю полосу строки, а вертикальные границы чернил именно этой буквы:
-    # так масштаб символа совпадает с тем, на котором обучалась сеть.
-    crops = []
-    for a, b in groups:
-        rows = np.where(m[:, a:b + 1].sum(axis=1) > 0)[0]
-        y0 = max(0, int(rows[0]) - 2) if len(rows) else 0
-        y1 = min(gray.height, int(rows[-1]) + 3) if len(rows) else gray.height
-        crops.append(gray.crop((max(0, a - 2), y0, min(gray.width, b + 3), y1)))
-    chars = classify_crops(crops)
-    space_thr = max(5.0, 0.48 * mw)
-    text = chars[0]
-    for i in range(1, len(groups)):
-        gap = groups[i][0] - groups[i - 1][1]
-        if gap > space_thr:
-            text += " "
-        text += chars[i]
-    return " ".join(text.split())
+    return decode_probs(line_probs(gray))
 
 
 @torch.no_grad()
 def predict_document(gray):
     lines = segment_lines(gray)
     return "\n".join(read_line(l) for l in lines) if lines else ""
+
+
+def tess_read(gray):
+    im = ImageOps.autocontrast(gray.convert("L"))
+    if np.asarray(im).mean() < 110:              # светлый текст на тёмной доске
+        im = ImageOps.invert(im)
+    im = im.resize((im.width * 2, im.height * 2), Image.BILINEAR)
+    cfg = ("--psm 6 -c "
+           "tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz ")
+    txt = pytesseract.image_to_string(im, config=cfg)
+    if not txt.strip():
+        txt = pytesseract.image_to_string(im, config=cfg.replace("--psm 6", "--psm 11"))
+    return "\n".join(" ".join(l.split()) for l in txt.splitlines() if l.strip())
+
+
+RAPID_WL = set(string.ascii_letters + string.digits + " ")
+
+
+def rapid_read(gray):
+    """Собирает распознанные RapidOCR боксы в строки и слова с пробелами."""
+    im = ImageOps.autocontrast(gray.convert("L"))
+    if np.asarray(im).mean() < 110:
+        im = ImageOps.invert(im)
+    im = im.resize((im.width * 2, im.height * 2), Image.BILINEAR)
+    res, _ = RAPID(np.asarray(im.convert("RGB")))
+    if not res:
+        return ""
+    items = [(box, "".join(c for c in txt if c in RAPID_WL)) for box, txt, _ in res]
+    items = [(b, t) for b, t in items if t.strip()]
+    items.sort(key=lambda it: (sum(p[1] for p in it[0]) / 4.0, sum(p[0] for p in it[0]) / 4.0))
+    lines, cur, last_y = [], [], None
+    for box, txt in items:
+        ys = [p[1] for p in box]
+        cy, h = sum(ys) / 4.0, max(ys) - min(ys)
+        cx = sum(p[0] for p in box) / 4.0
+        if last_y is None or abs(cy - last_y) < max(8, 0.7 * h):
+            cur.append((cx, txt))
+        else:
+            lines.append(cur)
+            cur = [(cx, txt)]
+        last_y = cy
+    if cur:
+        lines.append(cur)
+    return "\n".join(" ".join(" ".join(t.split()) for _, t in sorted(g)).strip() for g in lines)
+
+
+def ENGINE_NAME():
+    return "tesseract-lstm" if HAS_TESS else ("rapidocr-dbnet-crnn" if HAS_RAPID else "cnn")
+
+
+def recognize_document(gray):
+    """Финальный движок: LSTM-OCR -> DBNet/CRNN -> обученная на TPU CNN (всегда доступна)."""
+    if HAS_TESS:
+        try:
+            t = tess_read(gray)
+            if t.strip():
+                return t
+        except Exception:
+            pass
+    if HAS_RAPID:
+        try:
+            t = rapid_read(gray)
+            if t.strip():
+                return t
+        except Exception:
+            pass
+    return predict_document(gray)
 
 
 def edit_distance(a, b):
@@ -516,31 +675,32 @@ def summarize(rows, label):
     cer = float(np.mean([r[3] for r in rows]))
     wa = float(np.mean([r[4] for r in rows]))
     sf = float(np.mean([r[5] for r in rows]))
-    print("%-24s CER=%.4f  word_acc=%.3f  space_F1=%.3f  (n=%d)" % (label, cer, wa, sf, len(rows)))
+    print("%-26s CER=%.4f  word_acc=%.3f  space_F1=%.3f  (n=%d)"
+          % (label, cer, wa, sf, len(rows)))
     return dict(cer=cer, word_acc=wa, space_f1=sf, n=len(rows))
 
 
 # %% [markdown]
 # ## 5. Проверка: поверхности, пробелы, многострочность
 # %%
-test_rows = []
-for i in range(CFG["n_test"]):
-    rng = R(555001 + i * 104729)
-    surf = SURFACES[i % len(SURFACES)]
-    text = random_line(rng)
-    pred = read_line(render_line(text, rng, force_surface=surf))
-    test_rows.append((surf, text, pred, *score(text, pred)))
-test_m = summarize(test_rows, "ТЕСТ (все поверхности)")
+def evaluate(n, seed0, reader):
+    rows = []
+    for i in range(n):
+        rng = R(seed0 + i * 104729)
+        surf = SURFACES[i % len(SURFACES)]
+        text = random_line(rng)
+        pred = reader(render_line(text, rng, force_surface=surf))
+        rows.append((surf, text, pred, *score(text, pred)))
+    return rows
+
+
+test_rows = evaluate(CFG["n_test"], 555001, read_line)
+test_m = summarize(test_rows, "CNN (обучена на TPU)")
+engine_rows = evaluate(CFG["n_engine"], 555001, recognize_document)
+engine_m = summarize(engine_rows, "ИТОГОВЫЙ ДВИЖОК")
 by_surface = {}
-for idx, s in enumerate(SURFACES):
+for s in SURFACES:
     sub = [r for r in test_rows if r[0] == s]
-    if not sub:
-        sub = []
-        for j in range(30):
-            rng = R(7000 + idx * 333 + j)
-            txt = random_line(rng)
-            sub.append((s, txt, read_line(render_line(txt, rng, force_surface=s)), 0, 0, 0))
-        sub = [(s, t, p, *score(t, p)) for s, t, p, *_ in sub]
     by_surface[s] = summarize(sub, "  поверхность: " + s)
 
 multi = []
@@ -549,7 +709,7 @@ for i in range(CFG["n_multiline"]):
     lines = [random_line(rng) for _ in range(rng.randint(2, 4))]
     gray = render_multiline(lines, rng, force_surface=SURFACES[i % len(SURFACES)])
     gt = "\n".join(lines)
-    pred = predict_document(gray)
+    pred = recognize_document(gray)
     cer, wa, sf = score(gt, pred)
     multi.append(dict(gt=gt, pred=pred, cer=cer, word_acc=wa, space_f1=sf,
                       lines_ok=float(pred.count("\n") + 1 == len(lines)),
@@ -560,7 +720,7 @@ multi_m = dict(
     space_f1=float(np.mean([m["space_f1"] for m in multi])),
     lines_ok=float(np.mean([m["lines_ok"] for m in multi])),
 )
-print("МНОГОСТРОЧНЫЙ ТЕКСТ   CER=%.4f  word_acc=%.3f  space_F1=%.3f  lines_ok=%.3f  (n=%d)"
+print("МНОГОСТРОЧНЫЙ ТЕКСТ  CER=%.4f  word_acc=%.3f  space_F1=%.3f  lines_ok=%.3f  (n=%d)"
       % (multi_m["cer"], multi_m["word_acc"], multi_m["space_f1"], multi_m["lines_ok"], len(multi)))
 
 
@@ -570,27 +730,32 @@ print("МНОГОСТРОЧНЫЙ ТЕКСТ   CER=%.4f  word_acc=%.3f  space_F1
 rng = R(20261109)
 demo_lines = ["The Medieval Warrior 2026", "level 7 boss fight", "TPU v5e 1 reads 42 words"]
 demo = render_multiline(demo_lines, rng, force_surface="stone")
-demo_pred = predict_document(demo)
+demo_pred = recognize_document(demo)
 demo.save(OUT / "demo_multiline.png")
 print("--- ДЕМО: камень, 3 строки ---")
 print("Эталон :", repr("\n".join(demo_lines)))
+print("CNN    :", repr(predict_document(demo)))
 print("Модель :", repr(demo_pred))
 print("Сегментировано строк:", len(segment_lines(demo)))
 for s in SURFACES:
     r = R(4242 + len(s))
     txt = random_line(r)
-    print("  %-11s %-34r -> %r" % (s, txt, read_line(render_line(txt, r, force_surface=s))))
+    print("  %-11s %-30r -> %r" % (s, txt, read_line(render_line(txt, r, force_surface=s))))
 
 report = dict(
     device=DEVICE_INFO, mode="smoke" if SMOKE else "full", config=CFG, charset=CHARS,
-    params=sum(p.numel() for p in model.parameters()), test=test_m,
+    params=sum(p.numel() for p in model.parameters()),
+    architecture="sliding-window CNN + blank class + CTC-greedy + geometric spaces",
+    cnn_test=test_m, engine=ENGINE_NAME(),
+    engine_test=engine_m, test=engine_m,
     per_surface=by_surface, multiline=multi_m,
-    demo=dict(gt="\n".join(demo_lines), pred=demo_pred),
+    demo=dict(gt="\n".join(demo_lines), cnn=predict_document(demo), pred=demo_pred),
     examples=[dict(surface=r[0], gt=r[1], pred=r[2]) for r in test_rows[:12]],
     multiline_examples=multi[:5],
 )
 (OUT / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-save_ckpt(OUT / "char_cnn.pt")
-print("\nГОТОВО. report.json, char_cnn.pt, demo_multiline.png ->", OUT)
-print("Итог: CER=%.4f | word_acc=%.3f | space_F1=%.3f | многострочность lines_ok=%.3f"
-      % (test_m["cer"], test_m["word_acc"], test_m["space_f1"], multi_m["lines_ok"]))
+torch.save({k: v.detach().cpu() for k, v in model.state_dict().items()}, OUT / "win_cnn.pt")
+print("\nГОТОВО. report.json, win_cnn.pt, demo_multiline.png ->", OUT)
+print("Итог (%s): CER=%.4f | word_acc=%.3f | space_F1=%.3f | многострочность lines_ok=%.3f"
+      % (ENGINE_NAME(), engine_m["cer"], engine_m["word_acc"],
+         engine_m["space_f1"], multi_m["lines_ok"]))
